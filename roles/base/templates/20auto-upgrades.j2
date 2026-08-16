@@ -1,0 +1,8 @@
+// Managed by therminal. Local edits are overwritten.
+APT::Periodic::Update-Package-Lists "{{ 1 if unattended_upgrades | bool else 0 }}";
+APT::Periodic::Unattended-Upgrade "{{ 1 if unattended_upgrades | bool else 0 }}";
+APT::Periodic::AutocleanInterval "7";
+
+// Security updates only, and never an automatic reboot — a reboot decided by
+// apt at 06:00 would restart the heating controller without a rest period.
+Unattended-Upgrade::Automatic-Reboot "false";

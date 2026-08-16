@@ -1,0 +1,12 @@
+---
+# Single device. Connection details come from group_vars/all.yml, so the
+# hostname is configured in exactly one place.
+all:
+  children:
+    pi:
+      hosts:
+        therminal:
+          # pi_address overrides this when mDNS is unavailable. It is not the
+          # same as pi_hostname, which is the name set on the device itself.
+          ansible_host: "{{ pi_address | default(pi_hostname ~ '.local') }}"
+          ansible_user: "{{ pi_user }}"

@@ -1,0 +1,53 @@
+# Managed by therminal. Local edits are overwritten.
+[Unit]
+Description=Therminus heat pump controller
+Documentation=https://github.com/john30/ebusd/wiki
+After=network-online.target ebusd.service
+Wants=network-online.target ebusd.service
+
+# Give up restarting only if it fails 5 times inside 10 minutes, so a genuinely
+# broken deploy surfaces instead of looping forever. The health check reboots
+# the device if the service ends up dead.
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+[Service]
+Type=simple
+User=therminus
+Group=therminus
+
+# history.json is written relative to the working directory. Flask still finds
+# templates and static files, which it resolves from the app directory.
+WorkingDirectory=/var/lib/therminus
+ExecStart=/opt/therminus/venv/bin/python /opt/therminus/app/app.py --initial-state {{ therminus_initial_state }}
+
+# 30s rather than the default 100ms. A crash loop that restarts instantly would
+# repeatedly reinitialise the controller and could hammer the pump.
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=therminus
+
+# ── Sandboxing ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/therminus
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

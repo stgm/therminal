@@ -1,0 +1,15 @@
+# Local configuration — contains WiFi password and network details
+group_vars/all.yml
+
+# Console recovery password written by `make card`
+.card-password
+
+# Pulled from the device
+logs/
+backups/
+
+# Local tooling
+.venv/
+__pycache__/
+*.retry
+.DS_Store

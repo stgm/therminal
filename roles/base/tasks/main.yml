@@ -1,0 +1,168 @@
+---
+- name: Ensure config drop-in directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/ssh/sshd_config.d
+    - /etc/systemd/journald.conf.d
+    - /etc/systemd/system.conf.d
+
+- name: Set hostname
+  ansible.builtin.hostname:
+    name: "{{ pi_hostname }}"
+
+- name: Keep /etc/hosts in step with the hostname
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1\s'
+    line: "127.0.1.1\t{{ pi_hostname }}"
+
+- name: Read current timezone
+  ansible.builtin.command: timedatectl show --property=Timezone --value
+  register: current_timezone
+  changed_when: false
+
+- name: Set timezone
+  ansible.builtin.command: "timedatectl set-timezone {{ pi_timezone }}"
+  when: current_timezone.stdout != pi_timezone
+  changed_when: true
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install packages
+  ansible.builtin.apt:
+    name:
+      - avahi-daemon      # makes the Pi reachable as <hostname>.local
+      - rsync             # used by the deploy step
+      - git               # used to fetch the eBUS message definitions
+      - curl
+      - ca-certificates
+      - unattended-upgrades
+      - jq                # used by the health check
+    state: present
+
+- name: Enable avahi
+  ansible.builtin.systemd_service:
+    name: avahi-daemon
+    enabled: true
+    state: started
+
+- name: Install uv
+  ansible.builtin.shell:
+    cmd: >-
+      curl -LsSf https://astral.sh/uv/install.sh
+      | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+    creates: /usr/local/bin/uv
+
+# ── SSH ───────────────────────────────────────────────────────────────────────
+# The first-boot config already installed the authorized key and turned off
+# password authentication. This makes that explicit and survives OS updates
+# that rewrite the main sshd_config.
+
+- name: Confirm an authorized key is present before hardening SSH
+  ansible.builtin.stat:
+    path: "/home/{{ pi_user }}/.ssh/authorized_keys"
+  register: authorized_keys
+
+- name: Refuse to lock ourselves out
+  ansible.builtin.assert:
+    that:
+      - authorized_keys.stat.exists
+      - authorized_keys.stat.size > 0
+    fail_msg: >-
+      /home/{{ pi_user }}/.ssh/authorized_keys is missing or empty. Disabling
+      password login now would lock you out of a headless device. Install your
+      key first.
+
+- name: Harden sshd
+  ansible.builtin.template:
+    src: sshd-therminal.conf.j2
+    dest: /etc/ssh/sshd_config.d/10-therminal.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Restart sshd
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+- name: Cap journal size
+  ansible.builtin.template:
+    src: journald-therminal.conf.j2
+    dest: /etc/systemd/journald.conf.d/10-therminal.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart journald
+
+# ── Hardware watchdog ─────────────────────────────────────────────────────────
+
+- name: Check the watchdog device exists
+  ansible.builtin.stat:
+    path: /dev/watchdog
+  register: watchdog_device
+  when: watchdog_enabled | bool
+
+- name: Warn if the watchdog device is missing
+  ansible.builtin.debug:
+    msg: >-
+      /dev/watchdog not present. The hardware watchdog will not arm. Add
+      "dtparam=watchdog=on" to /boot/firmware/config.txt and reboot.
+  when:
+    - watchdog_enabled | bool
+    - not watchdog_device.stat.exists
+
+- name: Configure the systemd watchdog
+  ansible.builtin.template:
+    src: watchdog.conf.j2
+    dest: /etc/systemd/system.conf.d/10-therminal-watchdog.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: watchdog_enabled | bool
+  notify: Re-execute systemd
+
+# ── SD card longevity ─────────────────────────────────────────────────────────
+
+- name: Reduce swappiness
+  ansible.builtin.copy:
+    content: "vm.swappiness = {{ swappiness }}\n"
+    dest: /etc/sysctl.d/10-therminal.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctl
+
+# ── Unattended upgrades ───────────────────────────────────────────────────────
+
+- name: Configure unattended upgrades
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable unattended upgrades
+  ansible.builtin.systemd_service:
+    name: unattended-upgrades
+    enabled: "{{ unattended_upgrades | bool }}"
+    state: "{{ 'started' if unattended_upgrades | bool else 'stopped' }}"
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+
+- name: Remove first-boot config left on the boot partition
+  ansible.builtin.file:
+    path: "/boot/firmware/{{ item }}"
+    state: absent
+  loop:
+    - custom.toml
+    - firstrun.sh
+    - firstrun.log

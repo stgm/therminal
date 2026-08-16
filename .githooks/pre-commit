@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# Refuses commits that would put local configuration or secrets into history.
+#
+# .gitignore already keeps these out of a normal `git add`. This catches the
+# cases it cannot: `git add -f`, an edited .gitignore, or the same content
+# staged under a different filename. It matters because a WiFi password in
+# git history cannot be taken back by deleting the file or making the repo
+# private — it needs a history rewrite and a password change.
+#
+# Installed by `make hooks`. Bypass for a single commit with --no-verify.
+
+set -uo pipefail
+
+fail=0
+
+note() { printf '  %s\n' "$*" >&2; }
+
+blocked_path() {
+    case "$1" in
+        group_vars/all.yml|.card-password) return 0 ;;
+        logs/*|backups/*|*/.venv/*|.venv/*) return 0 ;;
+    esac
+    return 1
+}
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[[ -z "$staged" ]] && exit 0
+
+# ── blocked paths ─────────────────────────────────────────────────────────────
+
+while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    if blocked_path "$path"; then
+        if (( fail == 0 )); then
+            echo >&2
+            echo "pre-commit: refusing to commit local configuration" >&2
+        fi
+        note "$path"
+        fail=1
+    fi
+done <<< "$staged"
+
+if (( fail )); then
+    echo >&2
+    note "These hold WiFi credentials, the console password, or data pulled"
+    note "off the device. Unstage them:"
+    echo >&2
+    note "    git rm --cached <path>"
+    echo >&2
+fi
+
+# ── secret content under any filename ─────────────────────────────────────────
+# Catches a copy of the config saved as group_vars/pi.yml, all.yaml, or similar.
+# The hook itself is skipped so its own patterns do not match.
+
+content_fail=0
+while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    case "$path" in
+        .githooks/*) continue ;;
+    esac
+
+    blob=$(git show ":$path" 2>/dev/null) || continue
+
+    # A real wifi_password value. Example placeholders start with "your-".
+    hit=$(printf '%s\n' "$blob" \
+        | grep -nE '^[[:space:]]*wifi_password:[[:space:]]*.+' \
+        | grep -vE ':[[:space:]]*wifi_password:[[:space:]]*["'"'"']?your-' || true)
+
+    if [[ -n "$hit" ]]; then
+        if (( content_fail == 0 )); then
+            echo >&2
+            echo "pre-commit: refusing to commit what looks like a WiFi password" >&2
+            content_fail=1
+        fi
+        note "$path: $(printf '%s' "$hit" | head -1 | cut -c1-60)"
+        fail=1
+    fi
+
+    if printf '%s\n' "$blob" | grep -qE 'BEGIN[[:alnum:] ]*PRIVATE KEY'; then
+        echo >&2
+        echo "pre-commit: refusing to commit a private key" >&2
+        note "$path"
+        fail=1
+    fi
+done <<< "$staged"
+
+if (( fail )); then
+    echo >&2
+    note "If this is wrong, bypass once with: git commit --no-verify"
+    echo >&2
+    exit 1
+fi
+
+exit 0

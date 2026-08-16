@@ -1,0 +1,131 @@
+#!/bin/bash
+# Managed by therminal. Local edits are overwritten.
+#
+# Runs every {{ health_check_interval }} from therminus-health.timer.
+#
+# Two independent checks, each with its own failure counter:
+#
+#   app  — is the controller process serving and is its view of the bus healthy?
+#          Escalates to restarting therminus, then to rebooting the device.
+#   bus  — can ebusd be queried?
+#          Escalates to restarting ebusd, then to rebooting the device (a wedged
+#          WiFi stack on the Pi looks the same from here as a dead adapter, and
+#          a reboot fixes the former).
+#
+# Counters live in /var/lib/therminus-health and reset on the first success.
+
+set -uo pipefail
+
+STATE_DIR=/var/lib/therminus-health
+APP_COUNTER="$STATE_DIR/app-failures"
+BUS_COUNTER="$STATE_DIR/bus-failures"
+LAST_REBOOT="$STATE_DIR/last-reboot"
+
+APP_URL="http://127.0.0.1:{{ therminus_port }}"
+EBUSCTL="ebusctl -p {{ ebusd_port }}"
+
+RESTART_AT={{ health_failures_before_restart }}
+REBOOT_AT={{ health_failures_before_reboot }}
+
+# Never reboot more than once an hour. Without this, a fault the reboot cannot
+# fix turns into a boot loop that also stops the heating.
+REBOOT_COOLDOWN=3600
+
+mkdir -p "$STATE_DIR"
+
+log() { echo "$*"; }
+
+counter_read() { cat "$1" 2>/dev/null || echo 0; }
+counter_bump() { local n; n=$(( $(counter_read "$1") + 1 )); echo "$n" > "$1"; echo "$n"; }
+counter_clear() { echo 0 > "$1"; }
+
+reboot_allowed() {
+    local last now
+    last=$(counter_read "$LAST_REBOOT")
+    now=$(date +%s)
+    (( now - last >= REBOOT_COOLDOWN ))
+}
+
+do_reboot() {
+    date +%s > "$LAST_REBOOT"
+    log "REBOOT: $1"
+    systemctl reboot
+}
+
+# ── app check ─────────────────────────────────────────────────────────────────
+# The SSE stream emits a full snapshot immediately on connect, so one request
+# gives both liveness and the controller's own view of bus health without
+# needing a dedicated endpoint in the app.
+
+app_ok=1
+app_reports_bus_dead=0
+
+snapshot=$(timeout 20 curl -sN --max-time 15 "$APP_URL/api/stream" 2>/dev/null \
+    | awk '/^data: /{sub(/^data: /, ""); print; exit}')
+
+if [[ -z "$snapshot" ]]; then
+    app_ok=0
+    log "app: no snapshot from $APP_URL/api/stream"
+elif ! echo "$snapshot" | jq -e . >/dev/null 2>&1; then
+    app_ok=0
+    log "app: snapshot is not valid JSON"
+else
+    state=$(echo "$snapshot" | jq -r '.state // "unknown"')
+    room=$(echo "$snapshot" | jq -r '.room_temp // "none"')
+    reported_ok=$(echo "$snapshot" | jq -r '.bus.ok // false')
+    reported_fails=$(echo "$snapshot" | jq -r '.bus.failures // 0')
+    log "app: state=$state room=$room bus_ok=$reported_ok bus_failures=$reported_fails"
+
+    # Only trust the app's own bus verdict once it has actually missed reads.
+    # Before the first room temperature arrives the control loop never runs, so
+    # a fresh process can report an unhealthy bus without anything being wrong.
+    if [[ "$reported_ok" != "true" ]] && (( reported_fails >= 3 )); then
+        app_reports_bus_dead=1
+    fi
+fi
+
+# ── bus check ─────────────────────────────────────────────────────────────────
+# ebusctl is authoritative; the app's verdict corroborates it.
+
+bus_ok=1
+if ! $EBUSCTL info >/dev/null 2>&1; then
+    bus_ok=0
+    log "bus: ebusctl info failed"
+elif (( app_reports_bus_dead )); then
+    bus_ok=0
+    log "bus: ebusd answers but the controller cannot read the pump"
+fi
+
+# ── escalation ────────────────────────────────────────────────────────────────
+
+if (( app_ok )); then
+    counter_clear "$APP_COUNTER"
+else
+    n=$(counter_bump "$APP_COUNTER")
+    log "app: failure $n"
+    if (( n >= REBOOT_AT )) && reboot_allowed; then
+        do_reboot "therminus unreachable for $n consecutive checks"
+        exit 0
+    elif (( n >= RESTART_AT )); then
+        log "app: restarting therminus"
+        systemctl restart therminus
+    fi
+fi
+
+if (( bus_ok )); then
+    counter_clear "$BUS_COUNTER"
+else
+    n=$(counter_bump "$BUS_COUNTER")
+    log "bus: failure $n"
+    if (( n >= REBOOT_AT )) && reboot_allowed; then
+        do_reboot "ebusd unreachable for $n consecutive checks"
+        exit 0
+    elif (( n >= RESTART_AT )); then
+        log "bus: restarting ebusd"
+        systemctl restart ebusd
+    fi
+fi
+
+if (( app_ok && bus_ok )); then
+    log "ok"
+fi

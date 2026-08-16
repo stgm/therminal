@@ -1,0 +1,10 @@
+# Managed by therminal. Local edits are overwritten.
+[Unit]
+Description=Therminus health check
+After=therminus.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/therminus-health
+TimeoutStartSec=90
+SyslogIdentifier=therminus-health

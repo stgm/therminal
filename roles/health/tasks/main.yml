@@ -1,0 +1,55 @@
+---
+- name: Create the health check state directory
+  ansible.builtin.file:
+    path: /var/lib/therminus-health
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the health check script
+  ansible.builtin.template:
+    src: therminus-health.sh.j2
+    dest: /usr/local/bin/therminus-health
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the health check service
+  ansible.builtin.template:
+    src: therminus-health.service.j2
+    dest: /etc/systemd/system/therminus-health.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd for health
+
+- name: Install the health check timer
+  ansible.builtin.template:
+    src: therminus-health.timer.j2
+    dest: /etc/systemd/system/therminus-health.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd for health
+
+- name: Flush handlers before enabling the timer
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the health check timer
+  ansible.builtin.systemd_service:
+    name: therminus-health.timer
+    enabled: "{{ health_check_enabled | bool }}"
+    state: "{{ 'started' if health_check_enabled | bool else 'stopped' }}"
+
+- name: Run the health check once now
+  ansible.builtin.command: /usr/local/bin/therminus-health
+  register: health_now
+  changed_when: false
+  failed_when: false
+  when: health_check_enabled | bool
+
+- name: Report health check output
+  ansible.builtin.debug:
+    var: health_now.stdout_lines
+  when: health_check_enabled | bool

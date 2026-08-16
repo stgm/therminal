@@ -1,0 +1,9 @@
+# Managed by therminal. Local edits are overwritten.
+#
+# The packaged unit is Type=forking, so no -f. It also sets PIDFile and ebusd
+# logs to /var/log/ebusd.log by default (rotated by the package's logrotate
+# config), so --pidfile and -l are not needed either.
+#
+# "ens:" is the enhanced protocol over TCP, which is what the Adapter Shield v5
+# speaks in WiFi mode.
+EBUSD_OPTS="-d ens:{{ ebusd_adapter_host }}:{{ ebusd_adapter_port }} -p {{ ebusd_port }} -c {{ ebus_config_dir }}/{{ ebus_config_lang }} {{ ebusd_extra_opts }}"

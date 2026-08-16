@@ -1,0 +1,13 @@
+# Managed by therminal. Local edits are overwritten.
+#
+# Logs are kept on disk so `make logs` can retrieve history after a crash, but
+# capped so a chatty failure loop cannot fill or wear out the SD card.
+[Journal]
+Storage=persistent
+SystemMaxUse={{ journald_max_use }}
+SystemMaxFileSize={{ (journald_max_use | regex_replace('M$', '') | int // 8) }}M
+RuntimeMaxUse=16M
+MaxRetentionSec=1month
+
+# Batch writes rather than syncing every message.
+SyncIntervalSec=5m

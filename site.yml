@@ -1,0 +1,42 @@
+---
+- name: Configure the Therminus device
+  hosts: pi
+  become: true
+  # Deferred until after the temp directory exists, so fact gathering is not the
+  # thing that creates it and warns about its permissions.
+  gather_facts: false
+
+  pre_tasks:
+    - name: Wait for the device to accept SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+      tags: [always]
+
+    # raw, because it must not itself need the directory it is creating.
+    - name: Ensure Ansible's remote temp directory exists
+      ansible.builtin.raw: mkdir -p -m 0700 /root/.ansible/tmp
+      changed_when: false
+      tags: [always]
+
+    - name: Gather facts
+      ansible.builtin.setup:
+      tags: [always]
+
+    - name: Check this is a Raspberry Pi
+      ansible.builtin.assert:
+        that: ansible_facts['architecture'] in ['aarch64', 'armv7l', 'armv6l']
+        fail_msg: >-
+          Unexpected architecture {{ ansible_facts['architecture'] }}. This
+          playbook targets a Raspberry Pi. Check that inventory points at the
+          right host.
+      tags: [always]
+
+  roles:
+    - role: base
+      tags: [base]
+    - role: ebusd
+      tags: [ebusd]
+    - role: therminus
+      tags: [therminus, deploy]
+    - role: health
+      tags: [health]

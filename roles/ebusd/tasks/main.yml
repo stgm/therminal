@@ -1,0 +1,123 @@
+---
+- name: Map CPU architecture to the ebusd package suffix
+  ansible.builtin.set_fact:
+    ebusd_arch: "{{ {'aarch64': 'arm64', 'armv7l': 'armv7', 'armv6l': 'armv7'}[ansible_facts['architecture']] }}"
+
+- name: Check which ebusd version is installed
+  ansible.builtin.command: dpkg-query -W -f=${Version} ebusd
+  register: ebusd_installed
+  changed_when: false
+  failed_when: false
+
+- name: Download the ebusd package
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/john30/ebusd/releases/download/{{ ebusd_version }}/ebusd-{{ ebusd_version }}_{{ ebusd_arch }}-{{ ebusd_distro }}.deb
+    dest: "/tmp/ebusd-{{ ebusd_version }}_{{ ebusd_arch }}-{{ ebusd_distro }}.deb"
+    mode: "0644"
+  when: ebusd_version not in ebusd_installed.stdout
+
+- name: Install ebusd
+  ansible.builtin.apt:
+    deb: "/tmp/ebusd-{{ ebusd_version }}_{{ ebusd_arch }}-{{ ebusd_distro }}.deb"
+  when: ebusd_version not in ebusd_installed.stdout
+  notify: Restart ebusd
+
+# ── Message definitions ───────────────────────────────────────────────────────
+# Read from a local checkout rather than fetched from cfg.ebusd.eu, matching the
+# mac mini setup. `update` is false by default: a silent `git pull` could change
+# how the pump is addressed without anyone deciding to. Run `make ebus-config`
+# to update deliberately.
+
+- name: Clone the eBUS message definitions
+  ansible.builtin.git:
+    repo: "{{ ebus_config_repo }}"
+    dest: "{{ ebus_config_dir }}"
+    version: "{{ ebus_config_version }}"
+    update: "{{ ebus_config_update | bool }}"
+    depth: 1
+  notify: Restart ebusd
+
+- name: Check the definitions directory exists
+  ansible.builtin.stat:
+    path: "{{ ebus_config_dir }}/{{ ebus_config_lang }}"
+  register: ebus_config_lang_dir
+
+- name: Fail if the language subdirectory is missing
+  ansible.builtin.assert:
+    that: ebus_config_lang_dir.stat.isdir is defined and ebus_config_lang_dir.stat.isdir
+    fail_msg: >-
+      {{ ebus_config_dir }}/{{ ebus_config_lang }} does not exist. Check
+      ebus_config_lang against the layout of {{ ebus_config_repo }}.
+
+# ── Service configuration ─────────────────────────────────────────────────────
+
+- name: Configure ebusd
+  ansible.builtin.template:
+    src: ebusd.default.j2
+    dest: /etc/default/ebusd
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart ebusd
+
+- name: Ensure the ebusd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/ebusd.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The packaged unit already restarts on failure. It orders itself after
+# network-online.target but never pulls that target in, so on a WiFi-only device
+# it can start before the network is actually up.
+- name: Make ebusd wait for the network
+  ansible.builtin.template:
+    src: ebusd-network.conf.j2
+    dest: /etc/systemd/system/ebusd.service.d/10-network.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd for ebusd
+    - Restart ebusd
+
+- name: Flush handlers so ebusd is running before it is checked
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable ebusd
+  ansible.builtin.systemd_service:
+    name: ebusd
+    enabled: true
+    state: started
+
+- name: Wait for ebusd to accept connections
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ ebusd_port }}"
+    timeout: 60
+
+# On a first run ebusd scans the bus, which takes a while. A failure here almost
+# always means the adapter address is wrong or the adapter is unreachable.
+- name: Check ebusd can see the bus
+  ansible.builtin.command: "ebusctl -p {{ ebusd_port }} info"
+  register: ebusd_info
+  changed_when: false
+  failed_when: false
+  retries: 6
+  delay: 10
+  until: ebusd_info.rc == 0
+
+- name: Report bus status
+  ansible.builtin.debug:
+    msg: "{{ ebusd_info.stdout_lines if ebusd_info.rc == 0 else ['ebusctl failed: ' ~ ebusd_info.stderr] }}"
+
+- name: Warn if the adapter is not reachable
+  ansible.builtin.debug:
+    msg: >-
+      ebusd is running but could not be queried. Check that
+      {{ ebusd_adapter_host }}:{{ ebusd_adapter_port }} is the current address
+      of the eBUS Adapter Shield, and give it a DHCP reservation so it stops
+      moving. Logs: journalctl -u ebusd and /var/log/ebusd.log
+  when: ebusd_info.rc != 0

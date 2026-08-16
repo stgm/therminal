@@ -1,0 +1,5 @@
+# Managed by therminal. Local edits are overwritten.
+[Unit]
+# The packaged unit orders itself After=network-online.target without wanting
+# it, so nothing guarantees the target is reached. The adapter is on WiFi.
+Wants=network-online.target

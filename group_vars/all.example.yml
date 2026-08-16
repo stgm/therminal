@@ -1,0 +1,124 @@
+---
+# Copy to group_vars/all.yml and fill in. That file is gitignored because it
+# holds your WiFi password.
+#
+#     cp group_vars/all.example.yml group_vars/all.yml
+
+# ── Device identity ───────────────────────────────────────────────────────────
+
+# Hostname. The Pi is reached at <pi_hostname>.local via mDNS, so nothing needs
+# a static IP or DHCP reservation. Whatever POSTs your room temperature will
+# use this name too.
+pi_hostname: therminus
+
+# Login account created on first boot. Use your own name, not "pi".
+pi_user: your-username
+
+pi_timezone: Etc/UTC
+pi_keymap: us
+
+# How this machine reaches the Pi. Defaults to <pi_hostname>.local, which works
+# as soon as the Pi boots because Raspberry Pi OS runs avahi. Set it to an IP
+# address only if mDNS does not work on your network — some routers and guest
+# VLANs block multicast. It is deliberately separate from pi_hostname, which is
+# the name configured *on* the device.
+# pi_address: "192.168.1.60"
+
+# ── WiFi ──────────────────────────────────────────────────────────────────────
+# Used only by `make card`, when writing the first-boot config to the SD card.
+# The Zero 2 W has a 2.4 GHz radio only — it cannot see a 5 GHz-only SSID.
+
+wifi_ssid: "your-network"
+wifi_password: "your-wifi-password"
+wifi_country: NL
+wifi_hidden: false
+
+# ── SSH ───────────────────────────────────────────────────────────────────────
+
+# Public key installed on the device at first boot. Password login over SSH is
+# never enabled.
+ssh_public_key_file: ~/.ssh/id_ed25519.pub
+
+# ── ebusd ─────────────────────────────────────────────────────────────────────
+
+ebusd_version: "26.1"
+
+# Must match the OS release you flashed. See `os_release` below.
+ebusd_distro: bookworm
+
+# IP address of the eBUS Adapter Shield v5 on your network. Give it a DHCP
+# reservation in your router — if this address moves, ebusd loses the bus.
+ebusd_adapter_host: "192.168.1.50"
+ebusd_adapter_port: 9999
+
+# Port ebusd listens on. Therminus connects to 127.0.0.1:8888 and this must
+# agree with EBUSD_PORT in therminus/ebus.py.
+ebusd_port: 8888
+
+# Everything except -d, -p and -c, which are built from the settings here.
+# This matches the mac mini invocation. Note that -f, -l and --pidfile are
+# deliberately absent: the packaged systemd unit is Type=forking and already
+# handles the pidfile and log file.
+ebusd_extra_opts: "--scanconfig --latency=20 --httpport=8889 --enablehex --accesslevel=*"
+
+# ── eBUS message definitions ──────────────────────────────────────────────────
+# Cloned onto the Pi and passed to ebusd with -c, the same as the local checkout
+# on the mac mini.
+
+ebus_config_repo: "https://github.com/eBUS/ebus.github.io"
+ebus_config_version: main
+ebus_config_dir: /opt/ebus-config
+ebus_config_lang: en
+
+# Left false so a run of `make setup` never silently changes how the pump is
+# addressed. `make ebus-config` updates the checkout deliberately.
+ebus_config_update: false
+
+# ── Therminus ─────────────────────────────────────────────────────────────────
+
+# Local path to the app repo. `make deploy` rsyncs from here.
+therminus_src: "~/dev/therminus"
+
+therminus_port: 6790
+
+# Controller state on startup. RESTING makes the device wait out a full rest
+# period after every boot, so a reboot loop cannot short-cycle the compressor.
+# IDLE lets it start heating on the first tick after boot.
+therminus_initial_state: RESTING
+
+# Python version for the app venv, downloaded and managed by uv.
+#
+# Must be 3.12 or newer. Bookworm's system Python is 3.11, which cannot parse
+# the app: logger.py nests double quotes inside an f-string expression, which
+# is PEP 701 syntax accepted only from 3.12 on. (The app's own README says
+# "3.11 or later", which is not accurate.)
+therminus_python: "3.12"
+
+# Where uv keeps managed interpreters. Must be readable by the therminus
+# service user, so not root's home.
+uv_python_dir: /opt/uv-python
+
+# ── Resilience ────────────────────────────────────────────────────────────────
+
+# Hardware watchdog. Reboots the Pi if the kernel stops responding.
+watchdog_enabled: true
+watchdog_runtime_sec: 14   # the BCM watchdog cannot exceed ~15s
+
+# Periodic health check. See roles/health/ for exactly what it tests.
+health_check_enabled: true
+health_check_interval: "5min"
+health_failures_before_restart: 3   # ~15 min unreachable → restart the service
+health_failures_before_reboot: 12   # ~60 min unreachable → reboot the device
+
+# ── SD card longevity ─────────────────────────────────────────────────────────
+
+journald_max_use: 64M
+swappiness: 10
+unattended_upgrades: true
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+
+# Which Raspberry Pi OS release you flashed. Kept here so `make card` and the
+# ebusd package selection stay in step. See README for why this defaults to
+# bookworm rather than trixie.
+os_release: bookworm

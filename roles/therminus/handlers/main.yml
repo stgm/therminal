@@ -1,0 +1,12 @@
+---
+- name: Reload systemd for therminus
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+# reset-failed first: a crash loop trips StartLimitBurst, after which systemd
+# refuses to start the unit at all and a plain restart silently does nothing.
+- name: Restart therminus
+  ansible.builtin.shell: |
+    systemctl reset-failed therminus.service 2>/dev/null || true
+    systemctl restart therminus.service
+  changed_when: true

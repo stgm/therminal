@@ -1,0 +1,12 @@
+# Managed by therminal. Local edits are overwritten.
+[Unit]
+Description=Run the Therminus health check every {{ health_check_interval }}
+
+[Timer]
+# Wait for the app to settle after boot before the first check.
+OnBootSec=5min
+OnUnitActiveSec={{ health_check_interval }}
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

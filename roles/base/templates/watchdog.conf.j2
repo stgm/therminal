@@ -1,0 +1,8 @@
+# Managed by therminal. Local edits are overwritten.
+#
+# The BCM watchdog is petted by systemd. If the kernel stops scheduling, the
+# hardware resets the board. The timeout cannot exceed roughly 15 seconds.
+[Manager]
+RuntimeWatchdogSec={{ watchdog_runtime_sec }}
+RebootWatchdogSec=2min
+ShutdownWatchdogSec=2min

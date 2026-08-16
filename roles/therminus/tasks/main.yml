@@ -1,0 +1,233 @@
+---
+- name: Check the app source exists locally
+  ansible.builtin.stat:
+    path: "{{ therminus_src | expanduser }}/app.py"
+  delegate_to: localhost
+  become: false
+  register: app_source
+
+- name: Fail if the app source is missing
+  ansible.builtin.assert:
+    that: app_source.stat.exists
+    fail_msg: >-
+      No app.py under {{ therminus_src }}. Set therminus_src in
+      group_vars/all.yml to your local Therminus checkout.
+
+- name: Create the therminus system user
+  ansible.builtin.user:
+    name: therminus
+    system: true
+    shell: /usr/sbin/nologin
+    home: /opt/therminus
+    create_home: false
+
+- name: Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "0755"
+  loop:
+    - { path: /opt/therminus, owner: root }
+    - { path: /opt/therminus/app, owner: therminus }
+    - { path: /var/lib/therminus, owner: therminus }
+
+- name: Create the staging directory
+  ansible.builtin.file:
+    path: "/home/{{ pi_user }}/.therminus-staging"
+    state: directory
+    owner: "{{ pi_user }}"
+    group: "{{ pi_user }}"
+    mode: "0755"
+
+# Two hops: rsync from the Mac into the login user's home (no privileges
+# needed), then into /opt as root. This avoids running rsync over sudo, which
+# needs extra configuration on the remote side.
+- name: Copy the app from this machine
+  ansible.builtin.command:
+    argv:
+      - rsync
+      - --archive
+      - --compress
+      - --delete
+      - --itemize-changes
+      - --exclude=.git
+      - --exclude=__pycache__
+      - --exclude=.venv
+      - --exclude=history.json
+      - --exclude=.DS_Store
+      - --exclude=CLAUDE.md
+      - "-e"
+      - "ssh -o StrictHostKeyChecking=accept-new"
+      - "{{ therminus_src | expanduser }}/"
+      - "{{ ansible_user }}@{{ ansible_host }}:/home/{{ pi_user }}/.therminus-staging/"
+  delegate_to: localhost
+  become: false
+  register: rsync_push
+  changed_when: rsync_push.stdout | trim | length > 0
+
+- name: Install the app into /opt
+  ansible.builtin.command:
+    argv:
+      - rsync
+      - --archive
+      - --delete
+      - --itemize-changes
+      - --chown=therminus:therminus
+      - "/home/{{ pi_user }}/.therminus-staging/"
+      - /opt/therminus/app/
+  register: rsync_install
+  changed_when: rsync_install.stdout | trim | length > 0
+  notify: Restart therminus
+
+- name: Create the managed interpreter directory
+  ansible.builtin.file:
+    path: "{{ uv_python_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check the virtualenv's Python version
+  ansible.builtin.command: /opt/therminus/venv/bin/python -c "import sys; print('%d.%d' % sys.version_info[:2])"
+  register: venv_python
+  changed_when: false
+  failed_when: false
+
+# Rebuilt rather than reused when the version is wrong, otherwise the `creates`
+# guard below would keep a venv built against the wrong interpreter forever.
+- name: Discard a virtualenv built with the wrong Python
+  ansible.builtin.file:
+    path: /opt/therminus/venv
+    state: absent
+  when: venv_python.rc != 0 or venv_python.stdout | trim != therminus_python
+
+- name: Create the virtualenv
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/uv
+      - venv
+      - --python
+      - "{{ therminus_python }}"
+      - /opt/therminus/venv
+    creates: /opt/therminus/venv/bin/python
+  environment:
+    UV_PYTHON_INSTALL_DIR: "{{ uv_python_dir }}"
+  notify: Restart therminus
+
+- name: Install dependencies
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/uv
+      - pip
+      - install
+      - --python
+      - /opt/therminus/venv/bin/python
+      - --requirement
+      - /opt/therminus/app/requirements.txt
+  environment:
+    UV_PYTHON_INSTALL_DIR: "{{ uv_python_dir }}"
+  register: uv_install
+  changed_when: "'Installed' in uv_install.stderr or 'Installed' in uv_install.stdout"
+  notify: Restart therminus
+
+# uv installs the interpreter mode 0700 under root. The service runs as
+# therminus and needs to read it, but it stays root-owned — it is shared, not
+# the app's to own. a+rX rather than a fixed mode so directories and binaries
+# keep their execute bit and data files do not gain one.
+- name: Make the managed interpreter readable by the service user
+  ansible.builtin.shell: "chown -R root:root {{ uv_python_dir }}; chmod -R a+rX {{ uv_python_dir }}"
+  changed_when: false
+
+# follow: false matters. venv/bin/python is a symlink to the shared interpreter
+# in {{ uv_python_dir }}; following it would chown that shared tree to the app
+# user and report changed on every run.
+- name: Set ownership of the virtualenv
+  ansible.builtin.file:
+    path: /opt/therminus/venv
+    state: directory
+    owner: therminus
+    group: therminus
+    recurse: true
+    follow: false
+
+# Catches a version mismatch between the app and the interpreter at deploy
+# time. Without this the first sign is a crash loop after the restart, which is
+# how the 3.11/3.12 f-string incompatibility surfaced.
+- name: Check the app parses with the deployed interpreter
+  ansible.builtin.command:
+    argv:
+      - /opt/therminus/venv/bin/python
+      - -c
+      - |
+        import pathlib, sys
+        failed = []
+        for p in sorted(pathlib.Path("/opt/therminus/app").glob("*.py")):
+            try:
+                compile(p.read_text(), str(p), "exec")
+            except SyntaxError as e:
+                failed.append(f"{p.name}:{e.lineno}: {e.msg}")
+        if failed:
+            sys.exit("app does not parse with this Python:\n  " + "\n  ".join(failed))
+        print("ok, python %d.%d" % sys.version_info[:2])
+  register: app_parses
+  changed_when: false
+
+- name: Install the service unit
+  ansible.builtin.template:
+    src: therminus.service.j2
+    dest: /etc/systemd/system/therminus.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd for therminus
+    - Restart therminus
+
+- name: Clear any previous failed state
+  ansible.builtin.command: systemctl reset-failed therminus.service
+  changed_when: false
+  failed_when: false
+
+- name: Flush handlers so the service is up before it is checked
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable therminus
+  ansible.builtin.systemd_service:
+    name: therminus
+    enabled: true
+    state: started
+
+# A bare "Timeout when waiting for 127.0.0.1:6790" says nothing about why. The
+# reason is always in the journal, so fetch it and fail with it attached.
+- name: Wait for the web interface
+  block:
+    - name: Wait for the port to open
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ therminus_port }}"
+        timeout: 60
+
+  rescue:
+    - name: Collect the reason it did not start
+      ansible.builtin.command: journalctl -u therminus --no-pager -n 40
+      register: therminus_journal
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with the service log
+      ansible.builtin.fail:
+        msg: |-
+          Therminus did not start listening on port {{ therminus_port }}.
+
+          Last 40 journal lines from the service:
+
+          {{ therminus_journal.stdout }}
+
+- name: Report where the interface is
+  ansible.builtin.debug:
+    msg:
+      - "Web interface:   http://{{ pi_hostname }}.local:{{ therminus_port }}/"
+      - "Room temp POST:  http://{{ pi_hostname }}.local:{{ therminus_port }}/roomtemp"
+      - "Repoint whatever currently posts to the mac mini at that address."

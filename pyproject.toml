@@ -1,0 +1,12 @@
+[project]
+name = "therminal"
+version = "0.1.0"
+description = "Provisioning and deployment for Therminus on a Raspberry Pi Zero 2 W"
+requires-python = ">=3.11"
+dependencies = [
+    "ansible-core>=2.18",
+    "pyyaml>=6.0",
+]
+
+# Only ansible-core is used. No Galaxy collections are required — every task in
+# this repo uses builtin modules, so there is no `ansible-galaxy install` step.
