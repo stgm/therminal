@@ -1,0 +1,69 @@
+# Managed by therminal. Local edits are overwritten.
+[Unit]
+Description=ebusmon heat pump dashboard
+Documentation=https://github.com/stgm/ebusmon
+After=network-online.target ebusd.service
+Wants=network-online.target ebusd.service
+
+# Restart with ebusd. ebusmon enumerates ebusd's message definitions once at
+# connect time and never again, so a connection that outlives an ebusd restart
+# keeps whatever it cached — including an empty set. Tying the two together
+# means every ebusd restart gets a matching re-enumeration.
+PartOf=ebusd.service
+
+# Monitoring only. It must never take the bus or the controller down with it,
+# so nothing here escalates to a reboot — systemd just keeps restarting it.
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+[Service]
+Type=simple
+User=ebusmon
+Group=ebusmon
+
+# The daily .jsonl files are written to data/ relative to the working
+# directory. Flask still finds templates and static files, which it resolves
+# from the app directory.
+WorkingDirectory=/var/lib/ebusmon
+
+# Wait for ebusd to finish scanning before connecting. See the script for why
+# After=ebusd.service alone is not enough.
+ExecStartPre=/usr/local/bin/ebusmon-wait-for-bus
+ExecStart=/opt/ebusmon/venv/bin/python /opt/ebusmon/app/app.py --config /opt/ebusmon/config.yaml
+
+# Must exceed ebusmon_bus_wait_seconds, since ExecStartPre counts towards it.
+TimeoutStartSec={{ ebusmon_bus_wait_seconds + 60 }}
+
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ebusmon
+
+# Lower priority than therminus and ebusd. On a 512 MB Zero 2 W the dashboard
+# is the thing that should lose, not the controller.
+Nice=10
+MemoryMax={{ ebusmon_memory_max }}
+
+# ── Sandboxing ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ebusmon
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

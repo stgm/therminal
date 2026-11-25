@@ -1,0 +1,270 @@
+---
+- name: Check the app source exists locally
+  ansible.builtin.stat:
+    path: "{{ ebusmon_src | expanduser }}/app.py"
+  delegate_to: localhost
+  become: false
+  register: ebusmon_source
+
+- name: Fail if the app source is missing
+  ansible.builtin.assert:
+    that: ebusmon_source.stat.exists
+    fail_msg: >-
+      No app.py under {{ ebusmon_src }}. Set ebusmon_src in
+      group_vars/all.yml to your local ebusmon checkout.
+
+- name: Create the ebusmon system user
+  ansible.builtin.user:
+    name: ebusmon
+    system: true
+    shell: /usr/sbin/nologin
+    home: /opt/ebusmon
+    create_home: false
+
+- name: Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "0755"
+  loop:
+    - { path: /opt/ebusmon, owner: root }
+    - { path: /opt/ebusmon/app, owner: ebusmon }
+    - { path: /var/lib/ebusmon, owner: ebusmon }
+    # The app writes data/YYYY-MM-DD.jsonl relative to its working directory.
+    - { path: /var/lib/ebusmon/data, owner: ebusmon }
+
+- name: Create the staging directory
+  ansible.builtin.file:
+    path: "/home/{{ pi_user }}/.ebusmon-staging"
+    state: directory
+    owner: "{{ pi_user }}"
+    group: "{{ pi_user }}"
+    mode: "0755"
+
+# Two hops, as for therminus: rsync from this machine into the login user's
+# home, then into /opt as root, so rsync never runs over sudo.
+- name: Copy the app from this machine
+  ansible.builtin.command:
+    argv:
+      - rsync
+      - --archive
+      - --compress
+      - --delete
+      - --itemize-changes
+      - --exclude=.git
+      - --exclude=__pycache__
+      - --exclude=.venv
+      - --exclude=data
+      - --exclude=doc
+      - --exclude=tests
+      - --exclude=.DS_Store
+      - --exclude=CLAUDE.md
+      - "-e"
+      - "ssh -o StrictHostKeyChecking=accept-new"
+      - "{{ ebusmon_src | expanduser }}/"
+      - "{{ ansible_user }}@{{ ansible_host }}:/home/{{ pi_user }}/.ebusmon-staging/"
+  delegate_to: localhost
+  become: false
+  register: ebusmon_rsync_push
+  changed_when: ebusmon_rsync_push.stdout | trim | length > 0
+
+- name: Install the app into /opt
+  ansible.builtin.command:
+    argv:
+      - rsync
+      - --archive
+      - --delete
+      - --itemize-changes
+      - --chown=ebusmon:ebusmon
+      - "/home/{{ pi_user }}/.ebusmon-staging/"
+      - /opt/ebusmon/app/
+  register: ebusmon_rsync_install
+  changed_when: ebusmon_rsync_install.stdout | trim | length > 0
+  notify: Restart ebusmon
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+# The charts and indicators come from the app's own config.yaml, so they are
+# edited in the ebusmon repo and not duplicated here. Only the connection
+# details are replaced: on the Pi, ebusd is local.
+#
+# sort_keys=false is not cosmetic. Where two fields share one chart, the app
+# takes the first as the primary series and the second as the comparison line,
+# so sorting them would silently swap the axes.
+
+- name: Read the app's config file
+  ansible.builtin.slurp:
+    src: "{{ ebusmon_config_src | expanduser }}"
+  delegate_to: localhost
+  become: false
+  register: ebusmon_config_raw
+
+- name: Install the config with the device's connection details
+  ansible.builtin.copy:
+    content: |
+      # Managed by therminal. Local edits are overwritten.
+      # Charts and indicators come from {{ ebusmon_config_src }};
+      # the ebusd and server sections are set from group_vars/all.yml.
+      {{ (ebusmon_config_raw.content | b64decode | from_yaml) | combine({
+           'ebusd': {'host': '127.0.0.1', 'port': ebusd_port | int},
+           'server': {'port': ebusmon_port | int},
+         }) | to_nice_yaml(indent=2, sort_keys=false) }}
+    dest: /opt/ebusmon/config.yaml
+    owner: root
+    group: ebusmon
+    mode: "0640"
+  notify: Restart ebusmon
+
+# ── Virtualenv ────────────────────────────────────────────────────────────────
+
+- name: Create the managed interpreter directory
+  ansible.builtin.file:
+    path: "{{ uv_python_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check the virtualenv's Python version
+  ansible.builtin.command: /opt/ebusmon/venv/bin/python -c "import sys; print('%d.%d' % sys.version_info[:2])"
+  register: ebusmon_venv_python
+  changed_when: false
+  failed_when: false
+
+- name: Discard a virtualenv built with the wrong Python
+  ansible.builtin.file:
+    path: /opt/ebusmon/venv
+    state: absent
+  when: ebusmon_venv_python.rc != 0 or ebusmon_venv_python.stdout | trim != ebusmon_python
+
+- name: Create the virtualenv
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/uv
+      - venv
+      - --python
+      - "{{ ebusmon_python }}"
+      - /opt/ebusmon/venv
+    creates: /opt/ebusmon/venv/bin/python
+  environment:
+    UV_PYTHON_INSTALL_DIR: "{{ uv_python_dir }}"
+  notify: Restart ebusmon
+
+# ebusmon declares its dependencies in pyproject.toml rather than a
+# requirements.txt, and uv reads them straight from it.
+- name: Install dependencies
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/uv
+      - pip
+      - install
+      - --python
+      - /opt/ebusmon/venv/bin/python
+      - --requirement
+      - /opt/ebusmon/app/pyproject.toml
+  environment:
+    UV_PYTHON_INSTALL_DIR: "{{ uv_python_dir }}"
+  register: ebusmon_uv_install
+  changed_when: "'Installed' in ebusmon_uv_install.stderr or 'Installed' in ebusmon_uv_install.stdout"
+  notify: Restart ebusmon
+
+- name: Make the managed interpreter readable by the service user
+  ansible.builtin.shell: "chown -R root:root {{ uv_python_dir }}; chmod -R a+rX {{ uv_python_dir }}"
+  changed_when: false
+
+# follow: false — venv/bin/python is a symlink into the shared interpreter
+# tree, which is root's and not this app's to own.
+- name: Set ownership of the virtualenv
+  ansible.builtin.file:
+    path: /opt/ebusmon/venv
+    state: directory
+    owner: ebusmon
+    group: ebusmon
+    recurse: true
+    follow: false
+
+- name: Check the app parses with the deployed interpreter
+  ansible.builtin.command:
+    argv:
+      - /opt/ebusmon/venv/bin/python
+      - -c
+      - |
+        import pathlib, sys
+        failed = []
+        for p in sorted(pathlib.Path("/opt/ebusmon/app").glob("*.py")):
+            try:
+                compile(p.read_text(), str(p), "exec")
+            except SyntaxError as e:
+                failed.append(f"{p.name}:{e.lineno}: {e.msg}")
+        if failed:
+            sys.exit("app does not parse with this Python:\n  " + "\n  ".join(failed))
+        print("ok, python %d.%d" % sys.version_info[:2])
+  register: ebusmon_parses
+  changed_when: false
+
+# ── Service ───────────────────────────────────────────────────────────────────
+
+- name: Install the bus readiness wait
+  ansible.builtin.template:
+    src: ebusmon-wait-for-bus.sh.j2
+    dest: /usr/local/bin/ebusmon-wait-for-bus
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart ebusmon
+
+- name: Install the service unit
+  ansible.builtin.template:
+    src: ebusmon.service.j2
+    dest: /etc/systemd/system/ebusmon.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd for ebusmon
+    - Restart ebusmon
+
+- name: Clear any previous failed state
+  ansible.builtin.command: systemctl reset-failed ebusmon.service
+  changed_when: false
+  failed_when: false
+
+- name: Flush handlers so the service is up before it is checked
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable ebusmon
+  ansible.builtin.systemd_service:
+    name: ebusmon
+    enabled: true
+    state: started
+
+- name: Wait for the dashboard
+  block:
+    - name: Wait for the port to open
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ ebusmon_port }}"
+        timeout: 60
+
+  rescue:
+    - name: Collect the reason it did not start
+      ansible.builtin.command: journalctl -u ebusmon --no-pager -n 40
+      register: ebusmon_journal
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with the service log
+      ansible.builtin.fail:
+        msg: |-
+          ebusmon did not start listening on port {{ ebusmon_port }}.
+
+          Last 40 journal lines from the service:
+
+          {{ ebusmon_journal.stdout }}
+
+- name: Report where the dashboard is
+  ansible.builtin.debug:
+    msg:
+      - "Dashboard:  http://{{ pi_hostname }}.local:{{ ebusmon_port }}/"
+      - "Data files: /var/lib/ebusmon/data/"

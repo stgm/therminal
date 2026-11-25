@@ -1,0 +1,35 @@
+# Managed by therminal. Local edits are overwritten.
+
+server {
+    listen 80{% if site.default %} default_server{% endif %};
+
+    listen [::]:80{% if site.default %} default_server{% endif %};
+
+    server_name {{ site.server_name }};
+
+    # Off deliberately. Every request would otherwise be a write to the SD
+    # card, which this setup goes out of its way to avoid. Errors are still
+    # logged; there are few of them.
+    access_log off;
+    error_log /var/log/nginx/{{ site.name }}-error.log warn;
+
+    location / {
+        proxy_pass http://127.0.0.1:{{ site.port }};
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Empty Connection header rather than "close", so keepalive to the app
+        # survives, and "upgrade" when the client asks for a websocket.
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # Streaming responses must reach the browser as they are produced, not
+        # when nginx decides its buffer is full.
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+    }
+}

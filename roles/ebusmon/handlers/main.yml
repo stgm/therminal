@@ -1,0 +1,12 @@
+---
+- name: Reload systemd for ebusmon
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+# reset-failed first: a crash loop trips StartLimitBurst, after which systemd
+# refuses to start the unit at all and a plain restart silently does nothing.
+- name: Restart ebusmon
+  ansible.builtin.shell: |
+    systemctl reset-failed ebusmon.service 2>/dev/null || true
+    systemctl restart ebusmon.service
+  changed_when: true

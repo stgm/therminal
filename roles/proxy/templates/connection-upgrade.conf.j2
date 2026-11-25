@@ -1,0 +1,11 @@
+# Managed by therminal. Local edits are overwritten.
+#
+# $connection_upgrade is "upgrade" for a websocket handshake and empty
+# otherwise. Defined once here because a map may only appear in the http
+# context, not inside a server block.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+server_tokens off;

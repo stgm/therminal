@@ -1,0 +1,150 @@
+#!/bin/bash
+# Managed by therminal. Local edits are overwritten.
+#
+# WiFi recovery, in increasing order of how much it resets. Run as its own
+# transient unit by therminus-health, never inline, because the sequence must
+# not be terminated between unbinding the SDIO host and binding it again.
+#
+#   reload      unload and reload the driver. The chip's firmware has no flash
+#               to live in and is uploaded into its RAM on every driver load,
+#               so this re-attempts precisely the operation that fails when the
+#               board comes up without WiFi. ~3s. Does not power the chip down.
+#
+#   full-reset  unload the driver, unbind the SDIO host controller, cut WL_ON,
+#               restore it, rebind, reload. ~12s. This is a real power cycle of
+#               the chip plus a re-enumeration of the card, and is the strongest
+#               remedy available without disconnecting the board itself.
+#
+#               Both halves are needed. The slot is declared non-removable, so
+#               the MMC subsystem never rescans it; dropping WL_ON without
+#               unbinding the host leaves a stale device behind and the next
+#               probe fails with -110 (ETIMEDOUT). Unbinding is what makes the
+#               subsystem forget the card so it can enumerate a fresh one.
+#
+#   boot        used once at start-up: check, then reload, then full-reset.
+#
+# usage: therminus-recover reload|full-reset|boot
+
+set -uo pipefail
+
+WIFI_IF="{{ wifi_interface }}"
+SDIO_HOST="{{ wifi_sdio_host }}"
+SDIO_DRIVER=/sys/bus/platform/drivers/{{ wifi_sdio_driver }}
+WL_ON_GPIO={{ wifi_power_gpio }}
+MODULES=({{ wifi_modules | join(' ') }})
+WAIT_SECONDS={{ wifi_recovery_wait_seconds }}
+
+log() { echo "$*"; }
+
+interface_ready() {
+    ip -br addr show "$WIFI_IF" 2>/dev/null \
+        | grep -qE 'UP.*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+}
+
+wait_for_interface() {
+    local i
+    for (( i = 1; i <= WAIT_SECONDS; i++ )); do
+        if interface_ready; then
+            log "$WIFI_IF ready after ${i}s: $(ip -br addr show "$WIFI_IF" | tr -s ' ')"
+            return 0
+        fi
+        sleep 1
+    done
+    log "$WIFI_IF not ready after ${WAIT_SECONDS}s"
+    return 1
+}
+
+unload_driver() {
+    local m
+    for m in "${MODULES[@]}"; do
+        modprobe -r "$m" 2>/dev/null
+    done
+    sleep 1
+}
+
+load_driver() {
+    modprobe "${MODULES[-1]}"
+}
+
+do_reload() {
+    log "reload: unloading ${MODULES[*]}"
+    unload_driver
+    log "reload: loading ${MODULES[-1]}"
+    load_driver
+    wait_for_interface
+}
+
+# Refuse to unbind a controller that carries a mounted filesystem. The WiFi SDIO
+# host and the SD card host are separate controllers on this board, but the
+# device name is configuration and configuration can be wrong.
+sdio_host_is_safe() {
+    local dev
+    for dev in /sys/block/mmcblk*; do
+        [[ -e "$dev" ]] || continue
+        if [[ "$(readlink -f "$dev/device" 2>/dev/null)" == *"$SDIO_HOST"* ]]; then
+            log "full-reset: ABORT — $SDIO_HOST carries $(basename "$dev")"
+            return 1
+        fi
+    done
+    return 0
+}
+
+do_full_reset() {
+    if [[ ! -d "$SDIO_DRIVER" ]]; then
+        log "full-reset: $SDIO_DRIVER not present, falling back to reload"
+        do_reload
+        return
+    fi
+    sdio_host_is_safe || return 1
+
+    log "full-reset: unloading ${MODULES[*]}"
+    unload_driver
+
+    log "full-reset: unbinding $SDIO_HOST"
+    echo "$SDIO_HOST" > "$SDIO_DRIVER/unbind" 2>/dev/null
+    sleep 2
+
+    log "full-reset: cutting WL_ON (gpio $WL_ON_GPIO)"
+    pinctrl set "$WL_ON_GPIO" op dl
+    sleep 3
+    pinctrl set "$WL_ON_GPIO" op dh
+    sleep 2
+
+    log "full-reset: rebinding $SDIO_HOST"
+    echo "$SDIO_HOST" > "$SDIO_DRIVER/bind" 2>/dev/null
+    sleep 3
+
+    log "full-reset: loading ${MODULES[-1]}"
+    load_driver
+    wait_for_interface
+}
+
+case "${1:-}" in
+    reload)
+        do_reload
+        ;;
+    full-reset)
+        do_full_reset
+        ;;
+    boot)
+        # The periodic check does not run until OnBootSec, so a chip that failed
+        # to initialise during boot would otherwise sit unusable for that long
+        # before anything looked. Boot is exactly when this fault appears.
+        if interface_ready; then
+            log "boot: $WIFI_IF is up, nothing to do"
+            exit 0
+        fi
+        log "boot: $WIFI_IF not ready, attempting reload"
+        do_reload && exit 0
+        log "boot: reload did not help, attempting full reset"
+        do_full_reset && exit 0
+        log "boot: $WIFI_IF still unusable; leaving it to the periodic check"
+        # Deliberately successful: a WiFi failure must not fail the boot
+        # sequence or mark the unit failed for the rest of the uptime.
+        exit 0
+        ;;
+    *)
+        echo "usage: $(basename "$0") reload|full-reset|boot" >&2
+        exit 64
+        ;;
+esac

@@ -1,0 +1,22 @@
+# Managed by therminal. Local edits are overwritten.
+#
+# Checks once at start-up that the WiFi chip actually came up, and repairs it if
+# it did not. The periodic health check does not run until OnBootSec, so without
+# this the board would sit unreachable for that long after the one failure mode
+# that only ever appears at boot.
+[Unit]
+Description=Check the WiFi chip came up, and repair it if not
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/therminus-recover boot
+TimeoutStartSec={{ wifi_boot_timeout_sec }}
+SyslogIdentifier=therminus-wifi-boot
+# A chip that cannot be revived must not leave the unit failed or hold up the
+# rest of the boot; the periodic check takes over from here.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

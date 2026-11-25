@@ -7,6 +7,16 @@
     group: root
     mode: "0755"
 
+# The counters are now named fail-<class>; leaving the old ones would keep two
+# stale files around forever, since nothing reads or clears them any more.
+- name: Remove superseded failure counters
+  ansible.builtin.file:
+    path: "/var/lib/therminus-health/{{ item }}"
+    state: absent
+  loop:
+    - app-failures
+    - bus-failures
+
 - name: Install the health check script
   ansible.builtin.template:
     src: therminus-health.sh.j2
@@ -15,10 +25,27 @@
     group: root
     mode: "0755"
 
+- name: Install the WiFi recovery script
+  ansible.builtin.template:
+    src: therminus-recover.sh.j2
+    dest: /usr/local/bin/therminus-recover
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Install the health check service
   ansible.builtin.template:
     src: therminus-health.service.j2
     dest: /etc/systemd/system/therminus-health.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd for health
+
+- name: Install the boot-time WiFi check service
+  ansible.builtin.template:
+    src: therminus-wifi-boot.service.j2
+    dest: /etc/systemd/system/therminus-wifi-boot.service
     owner: root
     group: root
     mode: "0644"
@@ -41,6 +68,13 @@
     name: therminus-health.timer
     enabled: "{{ health_check_enabled | bool }}"
     state: "{{ 'started' if health_check_enabled | bool else 'stopped' }}"
+
+# Enabled but not started here: it is a boot-time check, and running it now
+# would only repeat what the health check below already does.
+- name: Enable the boot-time WiFi check
+  ansible.builtin.systemd_service:
+    name: therminus-wifi-boot.service
+    enabled: "{{ wifi_boot_check_enabled | bool }}"
 
 - name: Run the health check once now
   ansible.builtin.command: /usr/local/bin/therminus-health

@@ -1,0 +1,24 @@
+---
+# The vhosts nginx serves on port 80, and the names they answer to.
+#
+# The controller is the default_server, so a request that arrives by IP address
+# or under some other name lands there rather than on the dashboard.
+proxy_sites:
+  - name: therminus
+    server_name: "{{ therminus_host }}"
+    port: "{{ therminus_port }}"
+    default: true
+  - name: ebusmon
+    server_name: "{{ ebusmon_host }}"
+    port: "{{ ebusmon_port }}"
+    default: false
+
+# Names that avahi must be told about. The device already answers to its own
+# hostname, so that one is filtered out; anything else ending in .local is
+# published as a CNAME pointing at it.
+proxy_mdns_aliases: >-
+  {{ proxy_sites
+     | map(attribute='server_name')
+     | select('search', '\.local$')
+     | reject('equalto', pi_hostname ~ '.local')
+     | unique | list }}

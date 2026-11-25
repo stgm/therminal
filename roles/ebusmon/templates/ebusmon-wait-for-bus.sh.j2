@@ -1,0 +1,40 @@
+#!/bin/bash
+# Managed by therminal. Local edits are overwritten.
+#
+# Blocks until ebusd has finished scanning the bus and has message definitions
+# loaded, then lets ebusmon start.
+#
+# `After=ebusd.service` is not enough on its own. The packaged ebusd unit is
+# Type=forking, so systemd considers it started as soon as the daemon has
+# forked — well before --scanconfig has identified the devices on the bus and
+# loaded their .csv definitions. ebusmon enumerates the available messages once
+# at connect time and does not re-enumerate, so if it connects during that
+# window it finds nothing, caches an empty set, and serves a blank dashboard for
+# the rest of the process's life while appearing perfectly healthy.
+#
+# That is what emptied the dashboard from 3 September onwards: with no network,
+# ebusd never acquired the bus, the scan never completed, and ebusmon came up
+# with nothing and stayed that way for 53 hours.
+#
+# Always exits 0. If the bus never comes up, the dashboard should still start
+# and serve its history — an empty live view is better than no dashboard, and
+# refusing to start would trip the unit's restart limit instead.
+set -uo pipefail
+
+EBUSCTL="ebusctl -p {{ ebusd_port }}"
+DEADLINE=$(( SECONDS + {{ ebusmon_bus_wait_seconds }} ))
+
+while (( SECONDS < DEADLINE )); do
+    info=$($EBUSCTL info 2>/dev/null) || { sleep 2; continue; }
+    if grep -q '^scan: finished' <<<"$info"; then
+        messages=$(awk -F': ' '/^messages:/ {print $2; exit}' <<<"$info")
+        if [[ -n "${messages:-}" ]] && (( messages > 0 )); then
+            echo "bus ready after ${SECONDS}s: $messages message definitions loaded"
+            exit 0
+        fi
+    fi
+    sleep 2
+done
+
+echo "bus not ready after {{ ebusmon_bus_wait_seconds }}s; starting anyway with no live data"
+exit 0

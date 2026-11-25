@@ -94,9 +94,54 @@ therminus_initial_state: RESTING
 # "3.11 or later", which is not accurate.)
 therminus_python: "3.12"
 
-# Where uv keeps managed interpreters. Must be readable by the therminus
-# service user, so not root's home.
+# ── ebusmon ───────────────────────────────────────────────────────────────────
+# The read-only dashboard. It polls the same ebusd as therminus and writes its
+# own daily .jsonl files under /var/lib/ebusmon/data.
+
+# Local path to the dashboard repo. `make deploy` rsyncs from here.
+ebusmon_src: "~/dev/stgm/ebusmon"
+
+# Charts and indicators are read from this file at deploy time and installed on
+# the device with the ebusd and server sections replaced by the values here, so
+# chart configuration stays in the ebusmon repo.
+ebusmon_config_src: "{{ ebusmon_src }}/config.yaml"
+
+ebusmon_port: 6789
+
+# Python version for the dashboard venv, downloaded and managed by uv.
+# ebusmon's pyproject.toml sets requires-python = ">=3.14", so uv refuses to
+# install its dependencies into anything older. Separate from
+# therminus_python for that reason — the two apps do not share a venv.
+ebusmon_python: "3.14"
+
+# Cap on the dashboard's memory. The Zero 2 W has 512 MB and the controller
+# must not be the process the kernel kills when the dashboard grows.
+ebusmon_memory_max: 200M
+
+# How long to wait for ebusd to finish scanning the bus before starting the
+# dashboard. ebusmon enumerates ebusd's message definitions once at connect
+# time; connecting mid-scan leaves it with an empty set for the life of the
+# process. Exceeded, the dashboard starts anyway and serves history only.
+ebusmon_bus_wait_seconds: 120
+
+# Where uv keeps managed interpreters. Shared by both app venvs and must be
+# readable by their service users, so not root's home.
 uv_python_dir: /opt/uv-python
+
+# ── Web addresses ─────────────────────────────────────────────────────────────
+# nginx listens on port 80 and routes by name, so both apps are reachable
+# without a port number. Their own ports stay open and keep working.
+
+proxy_enabled: true
+
+# The controller answers on the device's own name, which avahi already
+# publishes. It is also the default vhost, so reaching the Pi by IP address
+# lands here.
+therminus_host: "{{ pi_hostname }}.local"
+
+# The dashboard needs a second name. It is published over mDNS as a CNAME
+# pointing at therminus_host, so a new DHCP lease does not break it.
+ebusmon_host: "ebusmon.local"
 
 # ── Resilience ────────────────────────────────────────────────────────────────
 
@@ -109,6 +154,34 @@ health_check_enabled: true
 health_check_interval: "5min"
 health_failures_before_restart: 3   # ~15 min unreachable → restart the service
 health_failures_before_reboot: 12   # ~60 min unreachable → reboot the device
+
+# Cap on reboots for one unbroken run of failures. Without it, a fault a reboot
+# cannot fix reboots the device every hour forever: the controller starts each
+# time in RESTING, so the heat pump would never run, and the card wears out.
+# Reset to zero by the first fully clean check.
+health_max_reboots: 3
+
+# WiFi recovery, tried before a reboot when the interface itself is missing.
+# Both steps are re-attempts at loading the chip's firmware, which lives on the
+# card and is uploaded into the chip's RAM at every driver load.
+health_wifi_reload_at: 3       # ~15 min → reload the driver (~3s outage)
+health_wifi_full_reset_at: 6   # ~30 min → power-cycle the chip (~12s outage)
+
+# Check at boot that the WiFi chip came up. The periodic check does not run
+# until OnBootSec, and a chip that fails to initialise does so during boot.
+wifi_boot_check_enabled: true
+wifi_boot_timeout_sec: 180
+
+wifi_interface: wlan0
+wifi_recovery_wait_seconds: 60
+
+# Hardware specifics for the full chip reset. Correct for a Pi Zero 2 W; check
+# these before deploying to a different board. `wifi_sdio_host` must not be the
+# controller holding the SD card — the recovery script refuses if it is.
+wifi_sdio_host: "3f300000.mmcnr"
+wifi_sdio_driver: mmc-bcm2835
+wifi_power_gpio: 41            # WL_ON, unclaimed by any driver on this board
+wifi_modules: [brcmfmac_wcc, brcmfmac]
 
 # ── SD card longevity ─────────────────────────────────────────────────────────
 

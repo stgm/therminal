@@ -1,4 +1,4 @@
-.PHONY: help hooks config card card-check setup base ebusd ebus-config deploy health check ssh status logs backup restart reboot poweroff lint
+.PHONY: help hooks config card card-check setup base ebusd ebus-config deploy therminus ebusmon proxy health check ssh status logs backup restart reboot poweroff lint
 
 SHELL := /usr/bin/env bash
 # PI_ADDRESS=192.168.1.x on the command line overrides how the Pi is reached,
@@ -15,7 +15,7 @@ help:
 	@echo "  make setup      provision everything on the Pi"
 	@echo
 	@echo "Day to day"
-	@echo "  make deploy     push the app and restart it"
+	@echo "  make deploy     push both apps and restart them"
 	@echo "  make status     service status and current controller state"
 	@echo "  make logs       pull logs into logs/  (SINCE='2 days ago')"
 	@echo "  make backup     pull history.json and effective config into backups/"
@@ -25,11 +25,14 @@ help:
 	@echo "  make base       OS configuration only"
 	@echo "  make ebusd      ebusd install and configuration only"
 	@echo "  make ebus-config  update the eBUS message definitions checkout"
+	@echo "  make therminus  deploy the controller only"
+	@echo "  make ebusmon    deploy the dashboard only"
+	@echo "  make proxy      web server and .local names only"
 	@echo "  make health     health check only"
 	@echo "  make check      dry run of the full playbook"
 	@echo
 	@echo "Recovery"
-	@echo "  make restart    restart therminus and ebusd"
+	@echo "  make restart    restart ebusd, therminus and ebusmon"
 	@echo "  make reboot     reboot the device"
 	@echo "  make poweroff   shut down cleanly before pulling the power"
 
@@ -72,6 +75,15 @@ ebus-config:
 deploy:
 	$(ANSIBLE) site.yml --tags deploy
 
+therminus:
+	$(ANSIBLE) site.yml --tags therminus
+
+ebusmon:
+	$(ANSIBLE) site.yml --tags ebusmon
+
+proxy:
+	$(ANSIBLE) site.yml --tags proxy
+
 health:
 	$(ANSIBLE) site.yml --tags health
 
@@ -85,7 +97,7 @@ ssh:
 	ssh $(HOST)
 
 status:
-	@ssh $(HOST) "systemctl --no-pager --lines=0 status therminus ebusd; \
+	@ssh $(HOST) "systemctl --no-pager --lines=0 status therminus ebusmon ebusd; \
 		echo; systemctl list-timers therminus-health --no-pager; \
 		echo; sudo /usr/local/bin/therminus-health"
 
@@ -96,7 +108,7 @@ backup:
 	PI_ADDRESS="$(PI_ADDRESS)" ./scripts/backup.sh
 
 restart:
-	ssh $(HOST) "sudo systemctl restart ebusd therminus"
+	ssh $(HOST) "sudo systemctl restart ebusd therminus ebusmon"
 
 reboot:
 	ssh $(HOST) "sudo systemctl reboot" || true

@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# Managed by therminal. Local edits are overwritten.
+#
+# Publishes extra .local names over mDNS as CNAMEs pointing at this device's
+# own hostname, so one Pi answers to several names.
+#
+# A CNAME rather than an address record: avahi resolves the target itself at
+# query time, so a new DHCP lease needs no republishing. The record lives as
+# long as this process holds its D-Bus connection, which is why the script
+# sleeps forever instead of exiting after Commit().
+
+import signal
+import sys
+import time
+
+import dbus
+
+AVAHI = "org.freedesktop.Avahi"
+SERVER_PATH = "/"
+SERVER_IFACE = "org.freedesktop.Avahi.Server"
+GROUP_IFACE = "org.freedesktop.Avahi.EntryGroup"
+
+IF_UNSPEC = -1
+PROTO_UNSPEC = -1
+CLASS_IN = 0x01
+TYPE_CNAME = 0x05
+TTL = 60
+
+ALIASES = [
+{% for alias in proxy_mdns_aliases %}
+    "{{ alias }}",
+{% endfor %}
+]
+
+
+def encode_name(name):
+    """A DNS name on the wire: each label prefixed with its length, then 0."""
+    out = bytearray()
+    for label in name.split("."):
+        if not label:
+            continue
+        encoded = label.encode("utf-8")
+        if len(encoded) > 63:
+            sys.exit("label too long in %s" % name)
+        out.append(len(encoded))
+        out.extend(encoded)
+    out.append(0)
+    return out
+
+
+def main():
+    if not ALIASES:
+        print("no aliases configured, nothing to publish")
+        signal.pause()
+
+    bus = dbus.SystemBus()
+    server = dbus.Interface(bus.get_object(AVAHI, SERVER_PATH), SERVER_IFACE)
+
+    # Waits out the window after avahi starts but before it has claimed a
+    # hostname. Failing here would just make systemd restart us into the same
+    # window.
+    for _ in range(30):
+        fqdn = str(server.GetHostNameFqdn())
+        if fqdn:
+            break
+        time.sleep(2)
+    else:
+        sys.exit("avahi has no hostname after 60s")
+
+    rdata = encode_name(fqdn)
+    group = dbus.Interface(
+        bus.get_object(AVAHI, server.EntryGroupNew()), GROUP_IFACE
+    )
+
+    for alias in ALIASES:
+        group.AddRecord(
+            IF_UNSPEC,
+            PROTO_UNSPEC,
+            dbus.UInt32(0),
+            alias,
+            CLASS_IN,
+            TYPE_CNAME,
+            TTL,
+            rdata,
+        )
+        print("publishing %s -> %s" % (alias, fqdn))
+
+    group.Commit()
+    print("published %d alias(es)" % len(ALIASES))
+
+    # The records are owned by this D-Bus connection. Exiting withdraws them.
+    signal.pause()
+
+
+if __name__ == "__main__":
+    main()

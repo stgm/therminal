@@ -3,32 +3,48 @@
 #
 # Runs every {{ health_check_interval }} from therminus-health.timer.
 #
-# Two independent checks, each with its own failure counter:
+# The connectivity probes form a dependency chain, evaluated in order:
 #
-#   app  — is the controller process serving and is its view of the bus healthy?
-#          Escalates to restarting therminus, then to rebooting the device.
-#   bus  — can ebusd be queried?
-#          Escalates to restarting ebusd, then to rebooting the device (a wedged
-#          WiFi stack on the Pi looks the same from here as a dead adapter, and
-#          a reboot fixes the former).
+#   wlan0 exists → gateway reachable → adapter reachable → ebusd has bus signal
 #
-# Counters live in /var/lib/therminus-health and reset on the first success.
+# The first failure in the chain is the diagnosis; everything after it is
+# skipped, because a downstream failure is explained by the upstream one and
+# counting both would escalate twice for one fault. The controller check is
+# independent of the chain — it talks to 127.0.0.1 and is not affected by the
+# network being down.
+#
+# Every remedy is attached to a fault it can actually repair. Two diagnoses have
+# no local remedy at all and are logged without escalating:
+#
+#   network-upstream  the router or access point is down. Rebooting this board
+#                     does not bring a router back, and would restart the
+#                     controller into its rest period for nothing.
+#   adapter           the eBUS adapter is unreachable although the network is
+#                     fine. Same reasoning.
+#
+# Counters live in /var/lib/therminus-health and reset on the first clean check.
 
 set -uo pipefail
 
 STATE_DIR=/var/lib/therminus-health
-APP_COUNTER="$STATE_DIR/app-failures"
-BUS_COUNTER="$STATE_DIR/bus-failures"
 LAST_REBOOT="$STATE_DIR/last-reboot"
+REBOOT_COUNT="$STATE_DIR/reboot-count"
 
 APP_URL="http://127.0.0.1:{{ therminus_port }}"
 EBUSCTL="ebusctl -p {{ ebusd_port }}"
+ADAPTER="{{ ebusd_adapter_host }}"
+WIFI_IF="{{ wifi_interface }}"
+RECOVER=/usr/local/bin/therminus-recover
+RECOVER_UNIT=therminus-recover
 
+RELOAD_AT={{ health_wifi_reload_at }}
+FULL_RESET_AT={{ health_wifi_full_reset_at }}
 RESTART_AT={{ health_failures_before_restart }}
 REBOOT_AT={{ health_failures_before_reboot }}
+MAX_REBOOTS={{ health_max_reboots }}
 
-# Never reboot more than once an hour. Without this, a fault the reboot cannot
-# fix turns into a boot loop that also stops the heating.
+# Never reboot more than once an hour. The board has no RTC, so this timestamp
+# is only a hint — see reboot_allowed(). MAX_REBOOTS is the real bound.
 REBOOT_COOLDOWN=3600
 
 mkdir -p "$STATE_DIR"
@@ -37,95 +53,191 @@ log() { echo "$*"; }
 
 counter_read() { cat "$1" 2>/dev/null || echo 0; }
 counter_bump() { local n; n=$(( $(counter_read "$1") + 1 )); echo "$n" > "$1"; echo "$n"; }
-counter_clear() { echo 0 > "$1"; }
+
+# Clear every failure counter. Called when the check comes back fully clean.
+counters_clear() {
+    rm -f "$STATE_DIR"/fail-* 2>/dev/null
+    echo 0 > "$REBOOT_COUNT"
+}
 
 reboot_allowed() {
-    local last now
+    local count last now delta
+    count=$(counter_read "$REBOOT_COUNT")
+    if (( count >= MAX_REBOOTS )); then
+        log "reboot: refused, already rebooted $count times without a clean check"
+        return 1
+    fi
+
     last=$(counter_read "$LAST_REBOOT")
     now=$(date +%s)
-    (( now - last >= REBOOT_COOLDOWN ))
+    delta=$(( now - last ))
+    # With no RTC the clock can step in either direction after a boot without
+    # network, so a negative delta means the timestamp is meaningless rather
+    # than that the reboot was in the future. Treat it as expired and rely on
+    # MAX_REBOOTS to bound the total.
+    if (( delta < 0 )); then
+        log "reboot: clock stepped backwards, ignoring the cooldown"
+        return 0
+    fi
+    (( delta >= REBOOT_COOLDOWN ))
 }
 
 do_reboot() {
     date +%s > "$LAST_REBOOT"
+    counter_bump "$REBOOT_COUNT" >/dev/null
     log "REBOOT: $1"
     systemctl reboot
 }
 
-# ── app check ─────────────────────────────────────────────────────────────────
-# The SSE stream emits a full snapshot immediately on connect, so one request
-# gives both liveness and the controller's own view of bus health without
-# needing a dedicated endpoint in the app.
+# Recovery that touches the WiFi driver takes longer than this unit's start
+# timeout allows and must not be killed halfway through — a script terminated
+# between "unbind the host" and "bind it again" would leave the board offline
+# for good. So it runs as its own transient unit.
+run_recovery() {
+    local mode="$1"
+    if systemctl is-active --quiet "$RECOVER_UNIT.service"; then
+        log "recovery: $RECOVER_UNIT already running, skipping this cycle"
+        return
+    fi
+    log "recovery: starting $mode"
+    systemd-run --unit="$RECOVER_UNIT" --collect \
+        --description="Therminus WiFi recovery ($mode)" \
+        "$RECOVER" "$mode" >/dev/null 2>&1
+}
+
+# ── probes ────────────────────────────────────────────────────────────────────
+
+wifi_interface_up() {
+    ip -br addr show "$WIFI_IF" 2>/dev/null \
+        | grep -qE 'UP.*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+}
+
+wifi_interface_exists() {
+    ip link show "$WIFI_IF" >/dev/null 2>&1
+}
+
+gateway_reachable() {
+    local gw
+    gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+    # No default route at all counts as unreachable rather than as "nothing to
+    # test" — it is the state the board is in when the interface is missing.
+    [[ -n "$gw" ]] || return 1
+    ping -c 2 -W 2 "$gw" >/dev/null 2>&1
+}
+
+adapter_reachable() {
+    ping -c 2 -W 2 "$ADAPTER" >/dev/null 2>&1
+}
+
+# ebusctl exits zero whenever the local daemon answers, which says nothing about
+# whether that daemon can reach the adapter. The bus state is in the output.
+bus_signal_ok() {
+    local out
+    out=$($EBUSCTL info 2>/dev/null) || return 1
+    grep -q '^signal: acquired' <<<"$out"
+}
+
+# ── diagnosis ─────────────────────────────────────────────────────────────────
+
+diagnosis=ok
+detail=""
+
+if ! wifi_interface_exists; then
+    diagnosis=wifi-local
+    detail="$WIFI_IF does not exist — the driver did not attach"
+elif ! wifi_interface_up; then
+    diagnosis=wifi-local
+    detail="$WIFI_IF exists but has no address"
+elif ! gateway_reachable; then
+    diagnosis=network-upstream
+    detail="default gateway does not answer — router or access point is down"
+elif ! adapter_reachable; then
+    diagnosis=adapter
+    detail="adapter $ADAPTER does not answer although the network is up"
+elif ! bus_signal_ok; then
+    diagnosis=bus
+    detail="adapter answers but ebusd has no bus signal"
+fi
+
+log "chain: $diagnosis${detail:+ — $detail}"
+
+# ── controller check ──────────────────────────────────────────────────────────
+# Independent of the chain above: it is served from 127.0.0.1 and stays
+# reachable while the network is down. The SSE stream emits a full snapshot on
+# connect, so one request gives liveness and the controller's own state.
 
 app_ok=1
-app_reports_bus_dead=0
-
 snapshot=$(timeout 20 curl -sN --max-time 15 "$APP_URL/api/stream" 2>/dev/null \
     | awk '/^data: /{sub(/^data: /, ""); print; exit}')
 
 if [[ -z "$snapshot" ]]; then
     app_ok=0
     log "app: no snapshot from $APP_URL/api/stream"
-elif ! echo "$snapshot" | jq -e . >/dev/null 2>&1; then
+elif ! jq -e . >/dev/null 2>&1 <<<"$snapshot"; then
     app_ok=0
     log "app: snapshot is not valid JSON"
 else
-    state=$(echo "$snapshot" | jq -r '.state // "unknown"')
-    room=$(echo "$snapshot" | jq -r '.room_temp // "none"')
-    reported_ok=$(echo "$snapshot" | jq -r '.bus.ok // false')
-    reported_fails=$(echo "$snapshot" | jq -r '.bus.failures // 0')
-    log "app: state=$state room=$room bus_ok=$reported_ok bus_failures=$reported_fails"
-
-    # Only trust the app's own bus verdict once it has actually missed reads.
-    # Before the first room temperature arrives the control loop never runs, so
-    # a fresh process can report an unhealthy bus without anything being wrong.
-    if [[ "$reported_ok" != "true" ]] && (( reported_fails >= 3 )); then
-        app_reports_bus_dead=1
-    fi
-fi
-
-# ── bus check ─────────────────────────────────────────────────────────────────
-# ebusctl is authoritative; the app's verdict corroborates it.
-
-bus_ok=1
-if ! $EBUSCTL info >/dev/null 2>&1; then
-    bus_ok=0
-    log "bus: ebusctl info failed"
-elif (( app_reports_bus_dead )); then
-    bus_ok=0
-    log "bus: ebusd answers but the controller cannot read the pump"
+    log "app: state=$(jq -r '.state // "unknown"' <<<"$snapshot")" \
+        "room=$(jq -r '.room_temp // "none"' <<<"$snapshot")" \
+        "bus_ok=$(jq -r '.bus.ok // false' <<<"$snapshot")" \
+        "bus_failures=$(jq -r '.bus.failures // 0' <<<"$snapshot")"
 fi
 
 # ── escalation ────────────────────────────────────────────────────────────────
 
+# Sets $fails rather than echoing it: log() writes to stdout, so a command
+# substitution here would capture the log line along with the number.
+fails=0
+escalate() {
+    local class="$1" counter
+    counter="$STATE_DIR/fail-$class"
+    fails=$(( $(counter_read "$counter") + 1 ))
+    echo "$fails" > "$counter"
+    log "$class: failure $fails"
+}
+
+case "$diagnosis" in
+    wifi-local)
+        escalate wifi-local
+        if (( fails >= REBOOT_AT )) && reboot_allowed; then
+            do_reboot "$WIFI_IF unusable for $fails consecutive checks"
+            exit 0
+        elif (( fails >= FULL_RESET_AT )); then
+            run_recovery full-reset
+        elif (( fails >= RELOAD_AT )); then
+            run_recovery reload
+        fi
+        ;;
+    network-upstream|adapter)
+        escalate "$diagnosis"
+        log "$diagnosis: no local remedy exists, not escalating"
+        ;;
+    bus)
+        escalate bus
+        if (( fails >= REBOOT_AT )) && reboot_allowed; then
+            do_reboot "ebusd without bus signal for $fails consecutive checks"
+            exit 0
+        elif (( fails >= RESTART_AT )); then
+            log "bus: restarting ebusd"
+            systemctl restart ebusd
+        fi
+        ;;
+esac
+
 if (( app_ok )); then
-    counter_clear "$APP_COUNTER"
+    rm -f "$STATE_DIR/fail-app"
 else
-    n=$(counter_bump "$APP_COUNTER")
-    log "app: failure $n"
-    if (( n >= REBOOT_AT )) && reboot_allowed; then
-        do_reboot "therminus unreachable for $n consecutive checks"
+    escalate app
+    if (( fails >= REBOOT_AT )) && reboot_allowed; then
+        do_reboot "therminus unreachable for $fails consecutive checks"
         exit 0
-    elif (( n >= RESTART_AT )); then
+    elif (( fails >= RESTART_AT )); then
         log "app: restarting therminus"
         systemctl restart therminus
     fi
 fi
 
-if (( bus_ok )); then
-    counter_clear "$BUS_COUNTER"
-else
-    n=$(counter_bump "$BUS_COUNTER")
-    log "bus: failure $n"
-    if (( n >= REBOOT_AT )) && reboot_allowed; then
-        do_reboot "ebusd unreachable for $n consecutive checks"
-        exit 0
-    elif (( n >= RESTART_AT )); then
-        log "bus: restarting ebusd"
-        systemctl restart ebusd
-    fi
-fi
-
-if (( app_ok && bus_ok )); then
+if [[ "$diagnosis" == ok ]] && (( app_ok )); then
+    counters_clear
     log "ok"
 fi

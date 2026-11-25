@@ -1,0 +1,44 @@
+# Managed by therminal. Local edits are overwritten.
+[Unit]
+Description=Publish extra .local names over mDNS
+After=avahi-daemon.service
+Requires=avahi-daemon.service
+
+# avahi drops every client-owned record when it restarts, so this must restart
+# with it or the aliases quietly disappear.
+PartOf=avahi-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mdns-alias
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mdns-alias
+
+# ── Sandboxing ────────────────────────────────────────────────────────────────
+# A real system account, not DynamicUser: the system D-Bus daemon refuses a
+# connection from a uid it cannot look up, and the script needs nothing else.
+User=mdns-alias
+Group=mdns-alias
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

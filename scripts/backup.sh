@@ -25,6 +25,15 @@ scp -q "$HOST:/var/lib/therminus/history.json" "$TARGET/history.json" || {
     echo "    no history.json yet" >&2
 }
 
+# The dashboard's daily .jsonl files. Like history.json, they are the one thing
+# on the device that cannot be rebuilt from this repo.
+echo "  ebusmon data"
+mkdir -p "$TARGET/ebusmon-data"
+scp -q "$HOST:/var/lib/ebusmon/data/*.jsonl" "$TARGET/ebusmon-data/" 2>/dev/null || {
+    echo "    no data files yet" >&2
+    rmdir "$TARGET/ebusmon-data"
+}
+
 echo "  effective configuration"
 {
     echo "=== /etc/default/ebusd ==="
@@ -32,6 +41,12 @@ echo "  effective configuration"
     echo
     echo "=== therminus.service ==="
     ssh "$HOST" "systemctl cat therminus" || true
+    echo
+    echo "=== ebusmon.service ==="
+    ssh "$HOST" "systemctl cat ebusmon" || true
+    echo
+    echo "=== ebusmon config.yaml ==="
+    ssh "$HOST" "sudo cat /opt/ebusmon/config.yaml" || true
     echo
     echo "=== ebusd drop-ins ==="
     ssh "$HOST" "systemctl cat ebusd" || true
@@ -44,7 +59,7 @@ echo "  effective configuration"
 } > "$TARGET/config.txt" 2>&1
 
 echo "  app tree checksum"
-ssh "$HOST" "find /opt/therminus/app -type f -not -path '*/__pycache__/*' -exec md5sum {} + | sort -k2" \
+ssh "$HOST" "find /opt/therminus/app /opt/ebusmon/app -type f -not -path '*/__pycache__/*' -exec md5sum {} + | sort -k2" \
     > "$TARGET/app-checksums.txt" 2>/dev/null || true
 
 echo

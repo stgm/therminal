@@ -31,6 +31,7 @@ fetch() {
 }
 
 fetch therminus therminus.service
+fetch ebusmon ebusmon.service
 fetch ebusd ebusd.service
 fetch health therminus-health.service
 
@@ -51,7 +52,7 @@ echo "  status"
     ssh "$HOST" "uptime"
     echo
     echo "=== services ==="
-    ssh "$HOST" "systemctl status therminus ebusd --no-pager -l" || true
+    ssh "$HOST" "systemctl status therminus ebusmon ebusd --no-pager -l" || true
     echo
     echo "=== timer ==="
     ssh "$HOST" "systemctl list-timers therminus-health --no-pager" || true

@@ -1,0 +1,142 @@
+---
+# One web server on port 80 in front of both apps, with a vhost per name. The
+# apps keep listening on their own ports; nothing about them changes, and the
+# health check still probes them directly.
+
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx-light
+    state: present
+
+# Four workers on a 512 MB board is memory spent on concurrency that a
+# single-household dashboard never uses. Main context, so it cannot be a
+# drop-in under conf.d.
+- name: Run a single nginx worker
+  ansible.builtin.lineinfile:
+    path: /etc/nginx/nginx.conf
+    regexp: '^worker_processes\s'
+    line: "worker_processes 1;"
+  notify: Reload nginx
+
+- name: Install shared http settings
+  ansible.builtin.template:
+    src: connection-upgrade.conf.j2
+    dest: /etc/nginx/conf.d/10-therminal.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Remove the packaged default site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload nginx
+
+- name: Install the vhosts
+  ansible.builtin.template:
+    src: nginx-site.conf.j2
+    dest: "/etc/nginx/sites-available/{{ site.name }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ proxy_sites }}"
+  loop_control:
+    loop_var: site
+    label: "{{ site.server_name }}"
+  notify: Reload nginx
+
+- name: Enable the vhosts
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ site.name }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ site.name }}.conf"
+    state: link
+  loop: "{{ proxy_sites }}"
+  loop_control:
+    loop_var: site
+    label: "{{ site.server_name }}"
+  notify: Reload nginx
+
+# Before the handler reloads anything. A config nginx refuses to load would
+# otherwise leave the running server on the old one with no visible failure.
+- name: Check the configuration parses
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Enable nginx
+  ansible.builtin.systemd_service:
+    name: nginx
+    enabled: true
+    state: started
+
+# ── mDNS aliases ──────────────────────────────────────────────────────────────
+# avahi already answers for the device's own hostname. Every other name in
+# proxy_sites has to be published explicitly.
+
+- name: Install the python dbus bindings
+  ansible.builtin.apt:
+    name: python3-dbus
+    state: present
+  when: proxy_mdns_aliases | length > 0
+
+- name: Create the mdns-alias system user
+  ansible.builtin.user:
+    name: mdns-alias
+    system: true
+    shell: /usr/sbin/nologin
+    home: /nonexistent
+    create_home: false
+  when: proxy_mdns_aliases | length > 0
+
+- name: Install the alias publisher
+  ansible.builtin.template:
+    src: mdns-alias.py.j2
+    dest: /usr/local/bin/mdns-alias
+    owner: root
+    group: root
+    mode: "0755"
+  when: proxy_mdns_aliases | length > 0
+  notify: Restart mdns-alias
+
+- name: Install the alias service unit
+  ansible.builtin.template:
+    src: mdns-alias.service.j2
+    dest: /etc/systemd/system/mdns-alias.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: proxy_mdns_aliases | length > 0
+  notify:
+    - Reload systemd for proxy
+    - Restart mdns-alias
+
+- name: Flush handlers so the aliases are live before they are checked
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the alias publisher
+  ansible.builtin.systemd_service:
+    name: mdns-alias
+    enabled: true
+    state: started
+  when: proxy_mdns_aliases | length > 0
+
+# ── Verification ──────────────────────────────────────────────────────────────
+
+- name: Check each site answers through the proxy
+  ansible.builtin.uri:
+    url: "http://127.0.0.1/"
+    headers:
+      Host: "{{ site.server_name }}"
+    status_code: [200, 301, 302, 401, 403, 404]
+  loop: "{{ proxy_sites }}"
+  loop_control:
+    loop_var: site
+    label: "{{ site.server_name }}"
+  register: proxy_probe
+  retries: 3
+  delay: 2
+  until: proxy_probe is succeeded
+
+- name: Report where the apps are
+  ansible.builtin.debug:
+    msg: "{{ proxy_sites | map(attribute='server_name') | map('regex_replace', '^(.*)$', 'http://\\1/') | list }}"

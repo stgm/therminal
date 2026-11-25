@@ -38,5 +38,10 @@
       tags: [ebusd]
     - role: therminus
       tags: [therminus, deploy]
+    - role: ebusmon
+      tags: [ebusmon, deploy]
+    - role: proxy
+      tags: [proxy]
+      when: proxy_enabled | bool
     - role: health
       tags: [health]
